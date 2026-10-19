@@ -1165,6 +1165,16 @@ class FlexibleTransformer(nn.Module):
     :param add_mask_token: Enable learnable [MASK] token for masked prediction.
         When enabled, use `context_mask` and/or `query_mask` in forward() to
         replace tokens at specified positions with the [MASK] token.
+    :param identity_attn_bias: If set, every block gets a learnable per-head
+        scalar, initialised to this value, that is added to the self-attention
+        logit of each context (and register) token attending to itself. Query
+        tokens get no bias. A large value (e.g. 10.0) makes each context token
+        attend almost only to itself at initialisation, so the block starts
+        close to the identity on the context stream (ResidualPred, De Melo
+        Costa et al., 2026). Only supported in joint attention mode
+        (``self_attn=True, cross_attn=False``).
+    :param zero_init_mlp: Zero-initialise the output layer of every block's
+        MLP, so each MLP branch starts as an exact no-op on the residual stream.
 
     Example::
 
@@ -1316,11 +1326,18 @@ class FlexibleTransformer(nn.Module):
         use_layer_scale: bool = False,
         layer_scale_init: float = 1e-5,
         max_grid_size: int = 32,
+        identity_attn_bias: Optional[float] = None,
+        zero_init_mlp: bool = False,
     ):
         super().__init__()
         if hidden_dim % num_heads != 0:
             raise ValueError(
                 f"hidden_dim ({hidden_dim}) must be divisible by num_heads ({num_heads})"
+            )
+        if identity_attn_bias is not None and (cross_attn or not self_attn):
+            raise ValueError(
+                "identity_attn_bias requires joint attention "
+                "(self_attn=True, cross_attn=False)"
             )
 
         self.hidden_dim = hidden_dim
@@ -1461,6 +1478,58 @@ class FlexibleTransformer(nn.Module):
             ]
         )
         self.final_norm = nn.LayerNorm(hidden_dim)
+
+        # One 1-D parameter per block (not a [depth, heads] tensor) so the
+        # default bias/norm rule keeps it out of weight decay.
+        self.identity_attn_bias = None
+        if identity_attn_bias is not None:
+            self.identity_attn_bias = nn.ParameterList(
+                [
+                    nn.Parameter(torch.full((num_heads,), float(identity_attn_bias)))
+                    for _ in range(depth)
+                ]
+            )
+
+        if zero_init_mlp:
+            for block in self.blocks:
+                out_layer = block.mlp.w3 if mlp_type == "swiglu" else block.mlp.fc2
+                nn.init.zeros_(out_layer.weight)
+                if out_layer.bias is not None:
+                    nn.init.zeros_(out_layer.bias)
+
+    def _identity_bias_masks(
+        self,
+        attn_mask: Optional[torch.Tensor],
+        n_self: int,
+        n_queries: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> list[torch.Tensor]:
+        """Build one additive self-attention mask per block for ``identity_attn_bias``.
+
+        :param attn_mask: Expanded boolean mask [T, T] or [B, T, T] (True =
+            blocked), or None
+        :param n_self: Number of leading tokens whose diagonal gets the bias
+            (registers + context)
+        :param n_queries: Number of trailing query tokens (no bias)
+        :param dtype: Mask dtype
+        :param device: Mask device
+        :return: List of ``depth`` float masks, each [1, H, T, T] or [B, H, T, T]
+        """
+        T = n_self + n_queries
+        diag = torch.zeros(T, device=device, dtype=dtype)
+        diag[:n_self] = 1.0
+        diag = torch.diag(diag)  # [T, T]
+
+        base = torch.zeros(1, 1, T, T, device=device, dtype=dtype)
+        if attn_mask is not None:
+            blocked = attn_mask if attn_mask.dim() == 3 else attn_mask.unsqueeze(0)
+            base = base.masked_fill(blocked.unsqueeze(1), float("-inf"))
+
+        return [
+            base + beta.to(dtype).view(1, -1, 1, 1) * diag
+            for beta in self.identity_attn_bias
+        ]
 
     def _gather_pos(self, idx: torch.Tensor, num_prefix: int = 0) -> torch.Tensor:
         """Gather positional embeddings for given indices.
@@ -1675,10 +1744,15 @@ class FlexibleTransformer(nn.Module):
                 attn_mask, n_registers, n_context_orig, n_queries, x.device
             )
 
-        for block in self.blocks:
-            x = block(
-                x, cond=cond, attn_mask=expanded_attn_mask, grid_size=self._rope_grid
+        if self.identity_attn_bias is not None:
+            block_masks = self._identity_bias_masks(
+                expanded_attn_mask, n_context, n_queries, x.dtype, x.device
             )
+        else:
+            block_masks = [expanded_attn_mask] * len(self.blocks)
+
+        for block, block_mask in zip(self.blocks, block_masks):
+            x = block(x, cond=cond, attn_mask=block_mask, grid_size=self._rope_grid)
         x = self.final_norm(x)
 
         # Extract register outputs if needed

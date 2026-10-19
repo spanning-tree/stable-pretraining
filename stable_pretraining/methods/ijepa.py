@@ -34,7 +34,7 @@ Example::
 """
 
 from dataclasses import dataclass
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import math
 import torch
@@ -92,6 +92,12 @@ class IJEPA(Module):
     :param ema_decay_start: Initial EMA decay (default: 0.996)
     :param ema_decay_end: Final EMA decay (default: 1.0)
     :param pretrained: Load pretrained encoder weights
+    :param predictor_identity_bias: If set, initial value of a learnable
+        per-head bias added to each predictor block's self-attention logits on
+        the context tokens' diagonal (default: None, no bias). ResidualPred
+        uses 10.0.
+    :param predictor_zero_init_mlp: Zero-initialise the output layer of every
+        predictor MLP (default: False). ResidualPred sets it to True.
 
     Example::
 
@@ -151,6 +157,8 @@ class IJEPA(Module):
         ema_decay_start: float = 0.996,
         ema_decay_end: float = 1.0,
         pretrained: bool = False,
+        predictor_identity_bias: Optional[float] = None,
+        predictor_zero_init_mlp: bool = False,
     ):
         super().__init__()
 
@@ -184,6 +192,8 @@ class IJEPA(Module):
             use_adaln=False,
             num_prefix_tokens=0,
             zero_init_output=False,
+            identity_attn_bias=predictor_identity_bias,
+            zero_init_mlp=predictor_zero_init_mlp,
         )
 
         # I-JEPA multi-block masking
