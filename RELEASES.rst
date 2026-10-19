@@ -25,7 +25,8 @@ Unreleased
   Spectral Anti-Collapse Regularization for Self-Supervised Learning" (2026).
   Registered in ``stable_pretraining.methods`` and ``METHODS.md``, with an
   ImageNet-100 ViT-S/16 benchmark under
-  ``benchmarks/imagenet100/lambdajepa-vit-small.py``.
+  ``benchmarks/imagenet100/lambdajepa-vit-small.py`` and an ImageNet-1k ViT-B/16
+  benchmark under ``benchmarks/imagenet1k/lambdajepa-vit-base.py``.
 
 **Discoverability improvements**
 
